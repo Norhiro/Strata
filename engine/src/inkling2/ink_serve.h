@@ -423,9 +423,54 @@ struct ActiveReq {
     double decode_t0 = 0.0;
     int drafts_offered = 0;
     int drafts_accepted = 0;
+    // DSpark gate (SpecGate below): running mean of drafts accepted per greedy tree step, steps since DSpark was
+    // (re)started, and plain tokens left before it is tried again.
+    double spec_rate = 0.0;
+    int spec_steps = 0;
+    int spec_pause = 0;
+    int spec_next_pause = 0;    // length of the next pause (0: SpecGate::pause_min); doubles while DSpark keeps losing
     bool cancelled = false;
     bool admitted = false;
     bool slot_read = false;
+};
+
+// When the drafts are mostly rejected, a greedy DSpark tree step costs more than the tokens it saves: on an RTX 5060
+// Ti with SQ-15 one step takes about 2.2x a plain token, so it only wins when it accepts more than about 1.2 drafts
+// per step (Japanese prose accepted 0.2-0.6, code and lists 2.9-3.4). The gate keeps a running mean of the accepted
+// drafts per step; after `min_steps` (5: 3 paused code at its slow start, 68 instead of 71 tok/s) steps below `min_accept` it decodes some tokens the plain way (the drafter still
+// ingests their taps, batch.capture_taps), then tries DSpark again. The pause starts at `pause_min` tokens and doubles,
+// up to `pause`, each time DSpark loses again right after a pause, so a slow start (code often begins below the gate)
+// costs little while prose that never accepts stays mostly plain. STRATA_INK_DSPARK_MIN_ACCEPT=0 turns it off.
+struct SpecGate {
+    double min_accept = 1.2;
+    int min_steps = 5;
+    int pause_min = 16;
+    int pause = 64;
+    static SpecGate from_env() {
+        SpecGate g;
+        if (const char* e = std::getenv("STRATA_INK_DSPARK_MIN_ACCEPT")) g.min_accept = std::atof(e);
+        if (const char* e = std::getenv("STRATA_INK_DSPARK_PAUSE")) g.pause = std::max(1, std::atoi(e));
+        if (const char* e = std::getenv("STRATA_INK_DSPARK_PAUSE_MIN")) g.pause_min = std::max(1, std::atoi(e));
+        if (const char* e = std::getenv("STRATA_INK_DSPARK_MIN_STEPS")) g.min_steps = std::max(1, std::atoi(e));
+        g.pause_min = std::min(g.pause_min, g.pause);
+        return g;
+    }
+    bool on() const { return min_accept > 0.0; }
+    // after a tree step that accepted `acc` drafts; true when DSpark should pause
+    bool after_step(ActiveReq& rq, int acc) const {
+        rq.spec_rate = (rq.spec_steps == 0) ? acc : 0.7 * rq.spec_rate + 0.3 * acc;
+        ++rq.spec_steps;
+        if (!on() || rq.spec_steps < min_steps) return false;
+        if (rq.spec_rate >= min_accept) {         // DSpark pays here: the next pause, if any, starts short again
+            rq.spec_next_pause = pause_min;
+            return false;
+        }
+        const int len = rq.spec_next_pause > 0 ? rq.spec_next_pause : pause_min;
+        rq.spec_pause = len;
+        rq.spec_next_pause = std::min(pause, len * 2);
+        rq.spec_steps = 0;
+        return true;
+    }
 };
 
 struct ServeConfig {
@@ -444,6 +489,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     const int P = std::max(1, std::min(kMaxParallelSlots, cfg.bopts.parallel));
     const int chunk_sz = std::max(1, cfg.bopts.chunk);
     const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
+    const SpecGate spec_gate = SpecGate::from_env();
 
     // Probe Vision shard lazily (zero VRAM/RAM until first image request)
     bool images_ok = false;
@@ -535,6 +581,10 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         rq.slot_read = pg.slot_read;
         rq.drafts_offered = 0;
         rq.drafts_accepted = 0;
+        rq.spec_rate = 0.0;
+        rq.spec_steps = 0;
+        rq.spec_pause = 0;
+        rq.spec_next_pause = 0;
         rq.t_start = now_s();
         rq.prompt_ms = 0.0;
         rq.decode_t0 = 0.0;
@@ -760,7 +810,14 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         }
 
         // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree (greedy) / Block-8 Rejection Sampling (temperature >= 0) (#6633)!
-        if (use_dspark && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
+        // SpecGate: while paused, this request decodes the plain way below (one token per pass); then DSpark again.
+        bool spec_paused = false;
+        if (use_dspark && n_active == 1 && reqs[sole_slot].spec_pause > 0 &&
+            reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len) {
+            --reqs[sole_slot].spec_pause;
+            spec_paused = true;
+        }
+        if (use_dspark && !spec_paused && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
             reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
             reqs[sole_slot].cur_pos + 8 < eff_max_ctx) {
             auto& rq = reqs[sole_slot];
@@ -778,6 +835,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 }
                 if (n_emit > 0) {
                     rq.drafts_offered += drafted;
+                    spec_gate.after_step(rq, n_emit - 1);
                     int kept = 0;
                     bool done = false;
                     const char* fin = nullptr;
@@ -868,6 +926,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     }
                 }
                 if (!done) {
+                    spec_gate.after_step(rq, accepted - 1);
                     if (accepted <= nd) {
                         // Rolled back to anchor + accepted tokens
                         backend.rollback_slot(rq.slot, rq.cur_pos + accepted);
@@ -883,6 +942,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         // 3. Continuous Batched 48-Visit Step across ALL active slots (B = 1..64)!
         // Coalesces chunked-prefill tokens + decode tokens from every active request into ONE StepBatch!
         batch.clear();
+        // Keep the drafter taps while SpecGate pauses DSpark: skipping them saved no time on an RTX 5060 Ti and left the
+        // drafter without the paused tokens, so code (which DSpark speeds up) then stayed below the gate (44 instead of 63 tok/s).
         batch.capture_taps = use_dspark;
         merged_img_embeds.clear();
         logit_slots.clear();
